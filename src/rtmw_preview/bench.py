@@ -15,6 +15,7 @@ from queue import Empty, Full, Queue
 import cv2
 import numpy as np
 
+from rtmw_preview.detector import YOLO26, PreparedDetection
 from rtmw_preview.pose import BalancedPose, SinglePersonPose, load_pose
 from rtmw_preview.runtime import ROOT, configure_logging
 
@@ -36,6 +37,10 @@ class VideoFrame:
     started: float
     decode_seconds: float
     prediction: SinglePersonPose | None = None
+    inference_started: float = 0.0
+    inference_finished: float = 0.0
+    prepared: PreparedDetection | None = None
+    preparation_seconds: float = 0.0
 
 
 def inferred_frames(
@@ -63,7 +68,13 @@ def inferred_frames(
                 if not available:
                     publish(decoded_queue, None)
                     return
-                publish(decoded_queue, VideoFrame(image, started, duration))
+                packet = VideoFrame(image, started, duration)
+                if isinstance(pose.detector, YOLO26):
+                    preparation_started = time.perf_counter()
+                    packet.prepared = pose.detector.prepare(image)
+                    packet.preparation_seconds = time.perf_counter() - preparation_started
+                    packet.prepared.preprocess_seconds = packet.preparation_seconds
+                publish(decoded_queue, packet)
         except Exception as exc:
             publish(decoded_queue, exc)
 
@@ -77,7 +88,13 @@ def inferred_frames(
                 if packet is None or isinstance(packet, Exception):
                     publish(inferred_queue, packet)
                     return
-                packet.prediction = pose.estimate(packet.image)
+                packet.inference_started = time.perf_counter()
+                if packet.prepared is None:
+                    packet.prediction = pose.estimate(packet.image)
+                else:
+                    packet.prediction = pose.estimate_prepared(packet.image, packet.prepared)
+                    packet.prepared = None
+                packet.inference_finished = time.perf_counter()
                 publish(inferred_queue, packet)
         except Exception as exc:
             publish(inferred_queue, exc)
@@ -134,6 +151,12 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
         detected_people = 0
         pose_frames = 0
         frame_latency = []
+        stage_samples = {name: [] for name in (
+            "decode", "input_stage", "detection", "pose", "draw", "encode", "inference_stage",
+            "output_stage", "before_inference_wait", "before_output_wait",
+            "detection_preprocess", "detection_inference_call", "detection_postprocess",
+            "detection_unattributed",
+        )}
         LOGGER.info("Starting %s: source_fps=%.3f reported_frames=%d output=%s",
                     video.name, source_fps, reported_frames, destination)
         with (destination / "frame.csv").open("w", newline="", encoding="utf-8") as stream:
@@ -141,9 +164,15 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
             telemetry.writerow([
                 "frame", "elapsed_s", "decode_ms", "detection_ms", "pose_ms", "draw_ms",
                 "pose_render_ms", "encode_ms", "frame_latency_ms", "detected_people", "pose_people",
+                *[f"{name}_ms" for name in (
+                    "inference_stage", "before_inference_wait", "before_output_wait",
+                    "detection_preprocess", "detection_inference_call", "detection_postprocess",
+                    "detection_unattributed", "input_stage",
+                )],
             ])
             started = last_report = time.perf_counter()
             for packet in frames:
+                output_started = time.perf_counter()
                 frame = packet.image
                 prediction = packet.prediction
                 assert prediction is not None
@@ -177,12 +206,44 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
                 detected_people += prediction.detected_people
                 pose_frames += int(prediction.detected_people > 0)
                 frame_latency.append(frame_duration * 1000)
+                durations = {
+                    "decode": decode_duration,
+                    "input_stage": decode_duration + packet.preparation_seconds,
+                    "detection": prediction.detection_seconds,
+                    "pose": prediction.pose_seconds,
+                    "draw": draw_duration,
+                    "encode": encode_duration,
+                    "inference_stage": packet.inference_finished - packet.inference_started,
+                    "output_stage": encoded - output_started,
+                    "before_inference_wait": (
+                        packet.inference_started - packet.started - packet.decode_seconds
+                        - packet.preparation_seconds
+                    ),
+                    "before_output_wait": output_started - packet.inference_finished,
+                }
+                if prediction.detection_timing is not None:
+                    durations.update({
+                        f"detection_{name}": seconds
+                        for name, seconds in prediction.detection_timing.items()
+                    })
+                    durations["detection_unattributed"] = (
+                        prediction.detection_seconds - sum(prediction.detection_timing.values())
+                    )
+                for name, seconds in durations.items():
+                    stage_samples[name].append(seconds * 1000)
                 telemetry.writerow([
                     frame_count, encoded - started, decode_duration * 1000,
                     prediction.detection_seconds * 1000, prediction.pose_seconds * 1000,
                     draw_duration * 1000, render_duration * 1000, encode_duration * 1000,
                     frame_duration * 1000, prediction.detected_people,
                     int(prediction.detected_people > 0),
+                    *[durations[name] * 1000 for name in (
+                        "inference_stage", "before_inference_wait", "before_output_wait",
+                    )],
+                    *[durations[name] * 1000 if name in durations else "" for name in (
+                        "detection_preprocess", "detection_inference_call", "detection_postprocess",
+                        "detection_unattributed", "input_stage",
+                    )],
                 ])
                 now = time.perf_counter()
                 if now - last_report >= REPORT_INTERVAL:
@@ -216,7 +277,29 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
                 f"视频可能提前解码结束：{video}，读取 {frame_count}/{reported_frames} 帧"
             )
         average_fps = frame_count / elapsed
+        stage_timing = {
+            name: {
+                "sample_count": len(samples),
+                "average_ms": float(np.mean(samples)),
+                "p50_ms": float(np.percentile(samples, 50)),
+                "p95_ms": float(np.percentile(samples, 95)),
+                "p99_ms": float(np.percentile(samples, 99)),
+            } if samples else None
+            for name, samples in stage_samples.items()
+        }
+        pipeline_stage = {}
+        for name in ("input_stage", "inference_stage", "output_stage"):
+            mean_seconds = float(np.mean(stage_samples[name])) / 1000
+            pipeline_stage[name] = {
+                "average_service_ms": mean_seconds * 1000,
+                "estimated_capacity_fps": 1 / mean_seconds,
+                "service_wall_time_ratio": sum(stage_samples[name]) / 1000 / elapsed,
+            }
+        bottleneck = max(pipeline_stage, key=lambda name: pipeline_stage[name]["average_service_ms"])
         summary = {
+            "schema_version": 3,
+            "detector_preprocess_stage": "input_stage" if isinstance(pose.detector, YOLO26)
+                                         else "inference_stage",
             "source": str(video),
             "inference": inference,
             "detector_providers": pose.detector.session.get_providers(),
@@ -239,6 +322,31 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
             "average_draw_ms": draw_seconds * 1000 / frame_count,
             "average_detected_people": detected_people / frame_count,
             "frames_with_pose": pose_frames,
+            "frames_without_pose": frame_count - pose_frames,
+            "average_pose_when_present_ms": pose_seconds * 1000 / pose_frames if pose_frames else None,
+            "stage_timing": stage_timing,
+            "pipeline_stage": pipeline_stage,
+            "estimated_bottleneck_stage": bottleneck,
+            "detector_input_size": list(pose.detector.model_input_size),
+            "pose_input_size": list(pose.pose.model_input_size),
+            "opencv_version": cv2.__version__,
+            "opencv_threads": cv2.getNumThreads(),
+            "timing_notes": {
+                "detection_breakdown": "Available for YOLO26 only; unsupported stages are null.",
+                "detection_inference_call": "rtmlib inference() wall time, including input layout "
+                                            "handling, runtime execution, transfers and synchronization; "
+                                            "not pure GPU time or an isolated session.run measurement.",
+                "queue_wait": "Time between stages includes queue backpressure and scheduling.",
+                "input_stage": "Decode plus detector preparation for YOLO26; decode only for YOLOX.",
+                "detection": "Total detection service time across input and inference threads; "
+                             "not the inference thread duration. Preprocessing includes array cleanup.",
+                "detection_unattributed": "Outer detection timing minus measured substages, "
+                                          "including call overhead, cleanup and scheduling.",
+                "stage_capacity": "Reciprocal of mean service time; an estimate, not measured FPS. "
+                                  "Output service includes first-frame writer setup, excludes telemetry.",
+                "service_wall_time_ratio": "Thread service time / video wall time; not GPU utilization.",
+                "provider": "Registered providers do not identify per-node placement or fallback.",
+            },
             "person_selection": "largest_bbox_area",
             "pipeline_queue_size": PIPELINE_QUEUE_SIZE,
             "encoder_finalize_seconds": finalize_seconds,

@@ -13,7 +13,7 @@ import numpy as np
 import onnxruntime as ort
 from rtmlib import RTMPose, YOLOX, draw_skeleton
 
-from rtmw_preview.detector import YOLO26
+from rtmw_preview.detector import YOLO26, PreparedDetection
 from rtmw_preview.model import configured_detector, download_model, export_yolo26m
 from rtmw_preview.runtime import ROOT, configure_logging
 
@@ -37,6 +37,7 @@ class SinglePersonPose:
     detected_people: int
     detection_seconds: float
     pose_seconds: float
+    detection_timing: dict[str, float] | None = None
 
 
 def load_gpu_runtime() -> None:
@@ -171,15 +172,33 @@ class BalancedPose:
         """Estimate only the largest xyxy person box by area on each frame."""
         started = time.perf_counter()
         boxes = self.detector(frame)
-        detected_at = time.perf_counter()
+        detection_seconds = time.perf_counter() - started
+        detection_timing = self.detector.last_timing if isinstance(self.detector, YOLO26) else None
+        return self.estimate_largest(frame, boxes, detection_seconds, detection_timing)
+
+    def estimate_prepared(self, frame: np.ndarray, prepared: PreparedDetection) -> SinglePersonPose:
+        """Consume an independently prepared YOLO26 input on the inference thread."""
+        assert isinstance(self.detector, YOLO26)
+        started = time.perf_counter()
+        boxes = self.detector.detect_prepared(prepared)
+        detection_seconds = time.perf_counter() - started + prepared.preprocess_seconds
+        return self.estimate_largest(frame, boxes, detection_seconds, self.detector.last_timing)
+
+    def estimate_largest(
+        self, frame: np.ndarray, boxes: np.ndarray, detection_seconds: float,
+        detection_timing: dict[str, float] | None,
+    ) -> SinglePersonPose:
+        """Select the largest detected person and estimate its whole-body pose."""
+        started = time.perf_counter()
         if len(boxes) == 0:
-            return SinglePersonPose(None, None, 0, detected_at - started, 0.0)
+            return SinglePersonPose(None, None, 0, detection_seconds, 0.0, detection_timing)
         areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
         largest = int(np.argmax(areas))
         keypoints, scores = self.pose(frame, bboxes=boxes[largest:largest + 1])
         return SinglePersonPose(
-            keypoints, scores, len(boxes), detected_at - started,
-            time.perf_counter() - detected_at,
+            keypoints, scores, len(boxes), detection_seconds,
+            time.perf_counter() - started,
+            detection_timing,
         )
 
     def draw(self, frame: np.ndarray, prediction: SinglePersonPose) -> np.ndarray:
