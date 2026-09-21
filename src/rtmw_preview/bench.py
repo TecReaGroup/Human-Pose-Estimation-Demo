@@ -4,11 +4,14 @@ import csv
 import json
 import logging
 import math
+import os
+import platform
 import threading
 import time
 import tomllib
 from collections.abc import Generator
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 from queue import Empty, Full, Queue
 
@@ -27,6 +30,11 @@ REPORT_INTERVAL = 1.0
 OUTPUT_CODEC = "mp4v"
 PIPELINE_QUEUE_SIZE = 2
 QUEUE_TIMEOUT = 0.1
+DETECTION_CALL_STAGE = (
+    "detection_input_layout", "detection_feed_setup", "detection_session_run",
+    "detection_input_cleanup", "detection_output_extract", "detection_call_unattributed",
+    "inference_unattributed", "prepared_input_release",
+)
 
 
 @dataclass
@@ -41,6 +49,7 @@ class VideoFrame:
     inference_finished: float = 0.0
     prepared: PreparedDetection | None = None
     preparation_seconds: float = 0.0
+    prepared_release_seconds: float = 0.0
 
 
 def inferred_frames(
@@ -93,7 +102,9 @@ def inferred_frames(
                     packet.prediction = pose.estimate(packet.image)
                 else:
                     packet.prediction = pose.estimate_prepared(packet.image, packet.prepared)
+                    release_started = time.perf_counter()
                     packet.prepared = None
+                    packet.prepared_release_seconds = time.perf_counter() - release_started
                 packet.inference_finished = time.perf_counter()
                 publish(inferred_queue, packet)
         except Exception as exc:
@@ -156,6 +167,7 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
             "output_stage", "before_inference_wait", "before_output_wait",
             "detection_preprocess", "detection_inference_call", "detection_postprocess",
             "detection_unattributed",
+            *DETECTION_CALL_STAGE,
         )}
         LOGGER.info("Starting %s: source_fps=%.3f reported_frames=%d output=%s",
                     video.name, source_fps, reported_frames, destination)
@@ -169,6 +181,7 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
                     "detection_preprocess", "detection_inference_call", "detection_postprocess",
                     "detection_unattributed", "input_stage",
                 )],
+                *[f"{name}_ms" for name in DETECTION_CALL_STAGE],
             ])
             started = last_report = time.perf_counter()
             for packet in frames:
@@ -220,14 +233,31 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
                         - packet.preparation_seconds
                     ),
                     "before_output_wait": output_started - packet.inference_finished,
+                    "prepared_input_release": packet.prepared_release_seconds,
                 }
+                durations["inference_unattributed"] = (
+                    durations["inference_stage"] - prediction.detection_seconds
+                    + packet.preparation_seconds - prediction.pose_seconds
+                    - packet.prepared_release_seconds
+                )
                 if prediction.detection_timing is not None:
                     durations.update({
                         f"detection_{name}": seconds
                         for name, seconds in prediction.detection_timing.items()
                     })
                     durations["detection_unattributed"] = (
-                        prediction.detection_seconds - sum(prediction.detection_timing.values())
+                        prediction.detection_seconds - sum(
+                            prediction.detection_timing[name]
+                            for name in ("preprocess", "inference_call", "postprocess")
+                        )
+                    )
+                    durations["detection_call_unattributed"] = (
+                        prediction.detection_timing["inference_call"] - sum(
+                            prediction.detection_timing[name] for name in (
+                                "input_layout", "feed_setup", "session_run",
+                                "input_cleanup", "output_extract",
+                            )
+                        )
                     )
                 for name, seconds in durations.items():
                     stage_samples[name].append(seconds * 1000)
@@ -244,6 +274,8 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
                         "detection_preprocess", "detection_inference_call", "detection_postprocess",
                         "detection_unattributed", "input_stage",
                     )],
+                    *[durations[name] * 1000 if name in durations else ""
+                      for name in DETECTION_CALL_STAGE],
                 ])
                 now = time.perf_counter()
                 if now - last_report >= REPORT_INTERVAL:
@@ -297,7 +329,17 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
             }
         bottleneck = max(pipeline_stage, key=lambda name: pipeline_stage[name]["average_service_ms"])
         summary = {
-            "schema_version": 3,
+            "schema_version": 5,
+            "detector_input_preparation": "direct_rgb_nchw_float32" if isinstance(pose.detector, YOLO26)
+                                          else "rtmlib_default",
+            "runtime_environment": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "logical_cpu_count": os.cpu_count(),
+                "numpy": np.__version__,
+                "onnxruntime_gpu": version("onnxruntime-gpu"),
+                "rtmlib": version("rtmlib"),
+            },
             "detector_preprocess_stage": "input_stage" if isinstance(pose.detector, YOLO26)
                                          else "inference_stage",
             "source": str(video),
@@ -333,9 +375,23 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
             "opencv_threads": cv2.getNumThreads(),
             "timing_notes": {
                 "detection_breakdown": "Available for YOLO26 only; unsupported stages are null.",
-                "detection_inference_call": "rtmlib inference() wall time, including input layout "
-                                            "handling, runtime execution, transfers and synchronization; "
+                "detection_inference_call": "YOLO26 prepared-tensor call wall time, including feed "
+                                            "setup, runtime execution, transfers and synchronization; "
                                             "not pure GPU time or an isolated session.run measurement.",
+                "detection_input_layout": "Zero for prepared YOLO26 inputs: RGB channel ordering, "
+                                          "float32 conversion and normalization are fused into final "
+                                          "contiguous NCHW tensor creation in detection_preprocess.",
+                "detection_input_cleanup": "Release of the feed dictionary only; the prepared tensor "
+                                           "is released separately in prepared_input_release.",
+                "detection_session_run": "Synchronous session.run wall time including runtime, "
+                                         "transfers and synchronization; not pure GPU execution time.",
+                "detection_call_breakdown": "input_layout + feed_setup + session_run + input_cleanup "
+                                            "+ output_extract + call_unattributed partition inference_call. "
+                                            "Do not add parent and child timings together.",
+                "inference_unattributed": "Inference thread duration minus detection work on this "
+                                          "thread, pose call and prepared input release.",
+                "gpu_utilization": "Not sampled. GPU clocks, power, temperature and node placement "
+                                   "cannot be inferred from these CPU wall-clock timings.",
                 "queue_wait": "Time between stages includes queue backpressure and scheduling.",
                 "input_stage": "Decode plus detector preparation for YOLO26; decode only for YOLOX.",
                 "detection": "Total detection service time across input and inference threads; "

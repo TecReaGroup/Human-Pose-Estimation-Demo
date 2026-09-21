@@ -16,7 +16,7 @@ INPUT_SIZE = (640, 640)
 class PreparedDetection:
     """Own a frame's detector input and original-coordinate transform."""
 
-    rgb: np.ndarray
+    tensor: np.ndarray
     width: int
     height: int
     scale: float
@@ -56,14 +56,21 @@ class YOLO26(BaseTool):
             left, input_width - resized_width - left,
             cv2.BORDER_CONSTANT, value=(114, 114, 114),
         )
-        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32)
-        rgb /= 255.0
-        return PreparedDetection(rgb, width, height, scale, left, top, time.perf_counter() - started)
+        tensor = np.empty((1, 3, input_height, input_width), dtype=np.float32)
+        # Write RGB planes directly into the final tensor without an HWC float buffer.
+        for channel in range(3):
+            np.divide(
+                padded[:, :, 2 - channel], np.float32(255.0),
+                out=tensor[0, channel], dtype=np.float32,
+            )
+        return PreparedDetection(tensor, width, height, scale, left, top, time.perf_counter() - started)
 
     def detect_prepared(self, prepared: PreparedDetection) -> np.ndarray:
         """Run a prepared input and restore person boxes to original-image coordinates."""
         started = time.perf_counter()
-        detections = self.inference(prepared.rgb)[0][0]
+        outputs = self.run_tensor(prepared.tensor)
+        output_started = time.perf_counter()
+        detections = outputs[0][0]
         inferred = time.perf_counter()
         selected = (
             (detections[:, 4] >= DETECTION_THRESHOLD)
@@ -79,5 +86,30 @@ class YOLO26(BaseTool):
             "preprocess": prepared.preprocess_seconds,
             "inference_call": inferred - started,
             "postprocess": time.perf_counter() - inferred,
+            **self.last_inference_timing,
+            "output_extract": inferred - output_started,
         }
         return boxes
+
+    def inference(self, img: np.ndarray) -> list[np.ndarray]:
+        """Accept rtmlib's HWC input for session warmup."""
+        tensor = np.ascontiguousarray(img.transpose(2, 0, 1), dtype=np.float32)[None]
+        return self.run_tensor(tensor)
+
+    def run_tensor(self, tensor: np.ndarray) -> list[np.ndarray]:
+        """Execute an owned contiguous NCHW float32 tensor without layout conversion."""
+        started = time.perf_counter()
+        session_input = {self.session.get_inputs()[0].name: tensor}
+        output_names = [output.name for output in self.session.get_outputs()]
+        feed_finished = time.perf_counter()
+        outputs = self.session.run(output_names, session_input)
+        run_finished = time.perf_counter()
+        del session_input
+        cleanup_finished = time.perf_counter()
+        self.last_inference_timing = {
+            "input_layout": 0.0,
+            "feed_setup": feed_finished - started,
+            "session_run": run_finished - feed_finished,
+            "input_cleanup": cleanup_finished - run_finished,
+        }
+        return outputs
