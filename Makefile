@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: install install-local TensorRT run bench
+.PHONY: install install-local TensorRT run bench verify
 
 install:
 	$(UV) sync --no-dev --upgrade
@@ -19,3 +19,6 @@ run:
 
 bench:
 	$(UV) run --no-dev python -m rtmw_preview.bench
+
+verify:
+	$(UV) run --no-dev python -m rtmw_preview.verify
