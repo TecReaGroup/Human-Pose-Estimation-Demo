@@ -1,7 +1,9 @@
-"""Download the official rtmlib balanced model pair."""
+"""Prepare detector and whole-body pose ONNX models."""
 
 import logging
+import os
 import shutil
+import tomllib
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -14,6 +16,51 @@ MODEL_URL = {
     "rtmw_x": "https://download.openmmlab.com/mmpose/v1/projects/rtmw/onnx_sdk/rtmw-dw-x-l_simcc-cocktail14_270e-256x192_20231122.zip",
 }
 LOGGER = logging.getLogger("model")
+DETECTOR_MODELS = ("yolox_m", "yolo26m")
+
+
+def configured_detector(inference: dict) -> str:
+    """Validate the configured detector at the configuration boundary."""
+    name = inference.get("detector_model", "yolox_m")
+    if name not in DETECTOR_MODELS:
+        raise ValueError(f"detector_model 必须为以下之一：{', '.join(DETECTOR_MODELS)}")
+    return name
+
+
+def export_yolo26m() -> Path:
+    """Export official YOLO26m weights to a static end-to-end ONNX model."""
+    target = MODEL_ROOT / "yolo26m.onnx"
+    if target.is_file():
+        return target
+    temporary = ROOT / "temp" / "export"
+    temporary.mkdir(parents=True, exist_ok=True)
+    MODEL_ROOT.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("YOLO_CONFIG_DIR", str(ROOT / "temp" / "ultralytics"))
+    os.environ["YOLO_AUTOINSTALL"] = "false"
+    from ultralytics import YOLO
+
+    weights = MODEL_ROOT / "yolo26m.pt"
+    if not weights.is_file():
+        pending = temporary / "yolo26m.pt.part"
+        LOGGER.info("Downloading official YOLO26m weights to %s", weights)
+        try:
+            url = "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26m.pt"
+            with urllib.request.urlopen(url, timeout=60) as response, pending.open("wb") as output:
+                shutil.copyfileobj(response, output)
+            pending.replace(weights)
+        finally:
+            pending.unlink(missing_ok=True)
+    export_weights = temporary / weights.name
+    shutil.copyfile(weights, export_weights)
+    LOGGER.info("Exporting YOLO26m ONNX (640x640, end-to-end, opset 17)")
+    exported = Path(YOLO(str(export_weights)).export(
+        format="onnx", imgsz=640, batch=1, dynamic=False, quantize=32,
+        simplify=False, opset=17, nms=False, device="cpu",
+    ))
+    exported.replace(target)
+    export_weights.unlink()
+    LOGGER.info("Model ready: %s", target)
+    return target
 
 
 def download_model(name: str) -> Path:
@@ -46,7 +93,12 @@ def download_model(name: str) -> Path:
 
 
 def main() -> None:
-    """Download both balanced models."""
+    """Prepare the configured detector and the whole-body pose model."""
     configure_logging()
-    for name in MODEL_URL:
-        download_model(name)
+    with (ROOT / "config" / "config.toml").open("rb") as stream:
+        detector = configured_detector(tomllib.load(stream)["inference"])
+    if detector == "yolo26m":
+        export_yolo26m()
+    else:
+        download_model(detector)
+    download_model("rtmw_x")

@@ -8,6 +8,8 @@ fourcc = "MJPG"
 frameInterval = 0.0
 
 [inference]
+# "yolox_m" or "yolo26m".
+detector_model = "yolo26m"
 # "tensorrt" or "onnxruntime" (CUDA).
 engine = "tensorrt"
 device_id = 0
