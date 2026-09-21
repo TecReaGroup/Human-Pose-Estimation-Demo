@@ -3,6 +3,8 @@
 import logging
 import os
 import sys
+import time
+import tomllib
 from importlib.metadata import version
 from pathlib import Path
 
@@ -11,7 +13,7 @@ import onnxruntime as ort
 from rtmlib import RTMPose, YOLOX, draw_skeleton
 
 from rtmw_preview.model import download_model
-from rtmw_preview.runtime import ROOT
+from rtmw_preview.runtime import ROOT, configure_logging
 
 LOGGER = logging.getLogger("inference")
 TRT_PROVIDER = "TensorrtExecutionProvider"
@@ -53,6 +55,7 @@ class BalancedPose:
             backend="onnxruntime", device="cpu",
         )
         for name, estimator in (("yolox_m", self.detector), ("rtmw_x", self.pose)):
+            started = time.perf_counter()
             estimator.session.disable_fallback()
             runtime_version = f"ort_{ort.__version__}_trt_{version('tensorrt-cu12')}"
             cache = ROOT / "temp" / "engine" / runtime_version / "exclude_topk" / name
@@ -77,6 +80,13 @@ class BalancedPose:
                 raise RuntimeError(f"{name}: TensorRT EP 加载失败，请检查 CUDA/TensorRT DLL。")
             width, height = estimator.model_input_size
             estimator.inference(np.zeros((height, width, 3), dtype=np.float32))
+            engines = list(cache.glob("*.engine"))
+            if not engines:
+                raise RuntimeError(f"{name}: 预热完成但没有生成 TensorRT 引擎缓存：{cache}")
+            LOGGER.info(
+                "%s: %d engine file(s) persisted to %s, initialization took %.1fs",
+                name, len(engines), cache, time.perf_counter() - started,
+            )
             LOGGER.info("%s ready, providers=%s", name, estimator.session.get_providers())
 
     def render(self, frame: np.ndarray) -> np.ndarray:
@@ -86,3 +96,22 @@ class BalancedPose:
             return frame
         keypoints, scores = self.pose(frame, bboxes=boxes)
         return draw_skeleton(frame, keypoints, scores, kpt_thr=self.threshold)
+
+
+def main() -> int:
+    """Build, warm up and persist both FP16 engines without opening the camera."""
+    configure_logging()
+    try:
+        with (ROOT / "config" / "config.toml").open("rb") as stream:
+            inference = tomllib.load(stream)["inference"]
+        LOGGER.info("Preparing YOLOX-M and RTMW-X TensorRT FP16 engines")
+        BalancedPose(**inference)
+        LOGGER.info("Both TensorRT FP16 engines are cached. Start the preview with make run.")
+    except Exception:
+        LOGGER.exception("TensorRT engine preparation failed")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
