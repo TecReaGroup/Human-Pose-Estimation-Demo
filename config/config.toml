@@ -1,0 +1,13 @@
+[camera]
+deviceId = 0
+backend = "dshow"
+colorImageSizeX = 1280
+colorImageSizeY = 720
+fps = 30
+fourcc = "MJPG"
+frameInterval = 0.0
+
+[inference]
+device_id = 0
+workspace_mb = 1024
+keypoint_threshold = 0.45
