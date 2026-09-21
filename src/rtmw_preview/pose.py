@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import tomllib
+from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
 
@@ -25,6 +26,17 @@ TRT_MODEL_PARTITION = {
     "rtmw_x": ("", 1),
 }
 DLL_DIRECTORY = []
+
+
+@dataclass
+class SinglePersonPose:
+    """Carry single-person predictions and synchronous call timings to rendering."""
+
+    keypoints: np.ndarray | None
+    scores: np.ndarray | None
+    detected_people: int
+    detection_seconds: float
+    pose_seconds: float
 
 
 def load_gpu_runtime() -> None:
@@ -152,12 +164,29 @@ class BalancedPose:
         return self
 
     def render(self, frame: np.ndarray) -> np.ndarray:
-        """Detect people and draw 133-keypoint whole-body skeletons."""
+        """Draw the largest person's 133-keypoint whole-body skeleton."""
+        return self.draw(frame, self.estimate(frame))
+
+    def estimate(self, frame: np.ndarray) -> SinglePersonPose:
+        """Estimate only the largest xyxy person box by area on each frame."""
+        started = time.perf_counter()
         boxes = self.detector(frame)
+        detected_at = time.perf_counter()
         if len(boxes) == 0:
+            return SinglePersonPose(None, None, 0, detected_at - started, 0.0)
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        largest = int(np.argmax(areas))
+        keypoints, scores = self.pose(frame, bboxes=boxes[largest:largest + 1])
+        return SinglePersonPose(
+            keypoints, scores, len(boxes), detected_at - started,
+            time.perf_counter() - detected_at,
+        )
+
+    def draw(self, frame: np.ndarray, prediction: SinglePersonPose) -> np.ndarray:
+        """Render predictions without accessing inference sessions."""
+        if prediction.keypoints is None:
             return frame
-        keypoints, scores = self.pose(frame, bboxes=boxes)
-        return draw_skeleton(frame, keypoints, scores, kpt_thr=self.threshold)
+        return draw_skeleton(frame, prediction.keypoints, prediction.scores, kpt_thr=self.threshold)
 
 
 def load_pose(inference: dict) -> BalancedPose:
