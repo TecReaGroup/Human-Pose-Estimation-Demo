@@ -39,18 +39,14 @@ class CameraWorker(QThread):
         """Initialize GPU sessions, acquire frames and render pose overlays."""
         camera = None
         try:
-            from rtmw_preview.pose import BalancedPose
+            from rtmw_preview.pose import load_pose
 
             sys.path.insert(0, str(ROOT))
             from device.UsbCamera import UsbCamera
 
-            self.status.emit("正在加载 RTMW balanced / 构建 TensorRT FP16 引擎…")
             inference = self.settings["inference"]
-            if inference["workspace_mb"] <= 0 or inference["device_id"] < 0:
-                raise ValueError("workspace_mb 必须大于 0，device_id 必须非负。")
-            if not 0 <= inference["keypoint_threshold"] <= 1:
-                raise ValueError("keypoint_threshold 必须介于 0 和 1。")
-            pose = BalancedPose(**inference)
+            self.status.emit(f"正在加载 RTMW balanced / {inference['engine']}…")
+            pose = load_pose(inference)
             if self.isInterruptionRequested():
                 return
             self.status.emit("正在打开相机…")
@@ -60,7 +56,7 @@ class CameraWorker(QThread):
             completed = deque(maxlen=30)
             last_capture = time.perf_counter()
             last_report = last_capture
-            self.status.emit("RTMW balanced · TensorRT FP16")
+            self.status.emit(f"RTMW balanced · {inference['engine']}")
             while not self.isInterruptionRequested():
                 _, frame = camera.getFrame(timeout=0.1)
                 if frame is None:
@@ -129,7 +125,7 @@ class PreviewWindow(QMainWindow):
 
     def __init__(self, settings: dict) -> None:
         super().__init__()
-        self.setWindowTitle("RTMW balanced | TensorRT FP16")
+        self.setWindowTitle(f"RTMW balanced | {settings['inference']['engine']}")
         self.resize(1280, 760)
         self.preview = Preview()
         self.setCentralWidget(self.preview)

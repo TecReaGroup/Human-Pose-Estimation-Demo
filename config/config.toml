@@ -8,6 +8,8 @@ fourcc = "MJPG"
 frameInterval = 0.0
 
 [inference]
+# "tensorrt" or "onnxruntime" (CUDA).
+engine = "tensorrt"
 device_id = 0
 workspace_mb = 1024
-keypoint_threshold = 0.45
+keypoint_threshold = 0.6

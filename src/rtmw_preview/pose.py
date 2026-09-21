@@ -1,4 +1,4 @@
-"""rtmlib preprocessing and decoding with explicit TensorRT FP16 sessions."""
+"""Whole-body pose inference with TensorRT or rtmlib ONNX Runtime CUDA."""
 
 import logging
 import os
@@ -17,8 +17,11 @@ from rtmw_preview.runtime import ROOT, configure_logging
 
 LOGGER = logging.getLogger("inference")
 TRT_PROVIDER = "TensorrtExecutionProvider"
-# TensorRT 10.9 limits TopK to K <= 3840; the detector exceeds this limit.
-TRT_EXCLUDED_OP = "TopK"
+# Keep the detector's small integer-index postprocessing partitions outside TRT.
+TRT_MODEL_PARTITION = {
+    "yolox_m": ("TopK,NonMaxSuppression", 50),
+    "rtmw_x": ("", 1),
+}
 DLL_DIRECTORY = []
 
 
@@ -43,30 +46,78 @@ def load_gpu_runtime() -> None:
 class BalancedPose:
     """Own the balanced detector and whole-body pose sessions."""
 
-    def __init__(self, device_id: int, workspace_mb: int, keypoint_threshold: float) -> None:
-        load_gpu_runtime()
+    def __init__(self, detector: YOLOX, pose: RTMPose, keypoint_threshold: float) -> None:
         self.threshold = keypoint_threshold
-        self.detector = YOLOX(
-            str(download_model("yolox_m")), model_input_size=(640, 640),
-            backend="onnxruntime", device="cpu",
+        self.detector = detector
+        self.pose = pose
+
+    @classmethod
+    def from_cuda(cls, device_id: int, keypoint_threshold: float) -> "BalancedPose":
+        """Create rtmlib's native ONNX Runtime CUDA sessions."""
+        ort.preload_dlls(directory="")
+        LOGGER.info("Initializing ONNX Runtime %s CUDA on device %d", ort.__version__, device_id)
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            raise RuntimeError("当前 ONNX Runtime 不提供 CUDA EP，请执行 make install。")
+        self = cls(
+            YOLOX(
+                str(download_model("yolox_m")), model_input_size=(640, 640),
+                backend="onnxruntime", device=f"cuda:{device_id}",
+            ),
+            RTMPose(
+                str(download_model("rtmw_x")), model_input_size=(192, 256),
+                backend="onnxruntime", device=f"cuda:{device_id}",
+            ),
+            keypoint_threshold,
         )
-        self.pose = RTMPose(
-            str(download_model("rtmw_x")), model_input_size=(192, 256),
-            backend="onnxruntime", device="cpu",
+        for name, estimator in (("yolox_m", self.detector), ("rtmw_x", self.pose)):
+            estimator.session.disable_fallback()
+            if "CUDAExecutionProvider" not in estimator.session.get_providers():
+                raise RuntimeError(f"{name}: CUDA EP 加载失败，请检查 CUDA/cuDNN DLL。")
+            width, height = estimator.model_input_size
+            estimator.inference(np.zeros((height, width, 3), dtype=np.float32))
+            LOGGER.info("%s ready, providers=%s", name, estimator.session.get_providers())
+        return self
+
+    @classmethod
+    def from_tensorrt(
+        cls, device_id: int, workspace_mb: int, keypoint_threshold: float,
+    ) -> "BalancedPose":
+        """Build or load and warm up TensorRT FP16 sessions."""
+        load_gpu_runtime()
+        self = cls(
+            YOLOX(
+                str(download_model("yolox_m")), model_input_size=(640, 640),
+                backend="onnxruntime", device="cpu",
+            ),
+            RTMPose(
+                str(download_model("rtmw_x")), model_input_size=(192, 256),
+                backend="onnxruntime", device="cpu",
+            ),
+            keypoint_threshold,
         )
         for name, estimator in (("yolox_m", self.detector), ("rtmw_x", self.pose)):
             started = time.perf_counter()
             estimator.session.disable_fallback()
             runtime_version = f"ort_{ort.__version__}_trt_{version('tensorrt-cu12')}"
-            cache = ROOT / "temp" / "engine" / runtime_version / "exclude_topk" / name
+            excluded_op, min_subgraph_size = TRT_MODEL_PARTITION[name]
+            partition = (
+                "exclude_" + excluded_op.replace(",", "_").lower()
+                + f"_min_{min_subgraph_size}"
+            )
+            cache = ROOT / "temp" / "engine" / runtime_version / partition / name
             cache.mkdir(parents=True, exist_ok=True)
             LOGGER.info("Building/loading %s TensorRT FP16 engine; first build may take minutes", name)
-            LOGGER.info("%s: executing %s outside TensorRT via ORT CUDA/CPU", name, TRT_EXCLUDED_OP)
+            LOGGER.info(
+                "%s: TensorRT excluded ops=%s, minimum subgraph size=%d; "
+                "remaining nodes use ORT CUDA/CPU, cache=%s",
+                name, excluded_op or "none", min_subgraph_size, cache,
+            )
             estimator.session.set_providers([
                 (TRT_PROVIDER, {
                     "device_id": device_id,
                     "trt_fp16_enable": True,
-                    "trt_op_types_to_exclude": TRT_EXCLUDED_OP,
+                    "trt_op_types_to_exclude": excluded_op,
+                    "trt_min_subgraph_size": min_subgraph_size,
                     "trt_max_workspace_size": workspace_mb * 1024 * 1024,
                     "trt_engine_cache_enable": True,
                     "trt_engine_cache_path": str(cache),
@@ -89,6 +140,8 @@ class BalancedPose:
             )
             LOGGER.info("%s ready, providers=%s", name, estimator.session.get_providers())
 
+        return self
+
     def render(self, frame: np.ndarray) -> np.ndarray:
         """Detect people and draw 133-keypoint whole-body skeletons."""
         boxes = self.detector(frame)
@@ -98,6 +151,26 @@ class BalancedPose:
         return draw_skeleton(frame, keypoints, scores, kpt_thr=self.threshold)
 
 
+def load_pose(inference: dict) -> BalancedPose:
+    """Validate inference configuration and initialize the selected engine."""
+    engine = inference["engine"]
+    if engine not in ("tensorrt", "onnxruntime"):
+        raise ValueError('engine 必须为 "tensorrt" 或 "onnxruntime"。')
+    device_id = inference["device_id"]
+    threshold = inference["keypoint_threshold"]
+    if device_id < 0:
+        raise ValueError("device_id 必须非负。")
+    if not 0 <= threshold <= 1:
+        raise ValueError("keypoint_threshold 必须介于 0 和 1。")
+    LOGGER.info("Selected inference engine=%s", engine)
+    if engine == "onnxruntime":
+        return BalancedPose.from_cuda(device_id, threshold)
+    workspace_mb = inference["workspace_mb"]
+    if workspace_mb <= 0:
+        raise ValueError("workspace_mb 必须大于 0。")
+    return BalancedPose.from_tensorrt(device_id, workspace_mb, threshold)
+
+
 def main() -> int:
     """Build, warm up and persist both FP16 engines without opening the camera."""
     configure_logging()
@@ -105,7 +178,7 @@ def main() -> int:
         with (ROOT / "config" / "config.toml").open("rb") as stream:
             inference = tomllib.load(stream)["inference"]
         LOGGER.info("Preparing YOLOX-M and RTMW-X TensorRT FP16 engines")
-        BalancedPose(**inference)
+        load_pose({**inference, "engine": "tensorrt"})
         LOGGER.info("Both TensorRT FP16 engines are cached. Start the preview with make run.")
     except Exception:
         LOGGER.exception("TensorRT engine preparation failed")
