@@ -1,3 +1,7 @@
+[logging]
+# DEBUG < PERF < INFO < WARNING < ERROR < CRITICAL
+level = "INFO"
+
 [camera]
 deviceId = 0
 backend = "dshow"

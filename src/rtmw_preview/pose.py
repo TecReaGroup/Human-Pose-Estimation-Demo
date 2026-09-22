@@ -15,7 +15,7 @@ from rtmlib import RTMPose, YOLOX, draw_skeleton
 
 from rtmw_preview.detector import YOLO26, PreparedDetection
 from rtmw_preview.model import configured_detector, download_model, export_yolo26m
-from rtmw_preview.runtime import ROOT, configure_logging
+from rtmw_preview.runtime import PERF, ROOT, configure_logging
 
 LOGGER = logging.getLogger("inference")
 TRT_PROVIDER = "TensorrtExecutionProvider"
@@ -156,8 +156,8 @@ class BalancedPose:
             engines = list(cache.glob("*.engine"))
             if not engines:
                 raise RuntimeError(f"{name}: 预热完成但没有生成 TensorRT 引擎缓存：{cache}")
-            LOGGER.info(
-                "%s: %d engine file(s) persisted to %s, initialization took %.1fs",
+            LOGGER.log(
+                PERF, "%s: %d engine file(s) persisted to %s, initialization took %.1fs",
                 name, len(engines), cache, time.perf_counter() - started,
             )
             LOGGER.info("%s ready, providers=%s", name, estimator.session.get_providers())

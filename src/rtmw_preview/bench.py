@@ -20,7 +20,7 @@ import numpy as np
 
 from rtmw_preview.detector import YOLO26, PreparedDetection
 from rtmw_preview.pose import BalancedPose, SinglePersonPose, load_pose
-from rtmw_preview.runtime import ROOT, configure_logging
+from rtmw_preview.runtime import PERF, ROOT, configure_logging
 
 LOGGER = logging.getLogger("bench")
 VIDEO_DIRECTORY = ROOT / "data" / "video"
@@ -280,7 +280,8 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
                 now = time.perf_counter()
                 if now - last_report >= REPORT_INTERVAL:
                     average_fps = frame_count / (now - started)
-                    LOGGER.info(
+                    LOGGER.log(
+                        PERF,
                         "%s: frames=%d/%d interval_fps=%.2f average_fps=%.2f "
                         "pose_render_ms=%.2f average_pose_render_ms=%.2f speed=%.2fx elapsed=%.1fs "
                         "avg_detect_ms=%.2f avg_pose_ms=%.2f avg_draw_ms=%.2f avg_encode_ms=%.2f",
@@ -420,7 +421,8 @@ def benchmark_video(video: Path, pose: BalancedPose, inference: dict, load_secon
             "output_codec": OUTPUT_CODEC,
         }
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        LOGGER.info(
+        LOGGER.log(
+            PERF,
             "%s complete: frames=%d average_fps=%.2f speed=%.2fx "
             "pose_render_ms=%.2f p95_frame_ms=%.2f elapsed=%.2fs summary=%s",
             video.name, frame_count, average_fps, average_fps / source_fps,
@@ -451,7 +453,7 @@ def main() -> int:
         started = time.perf_counter()
         pose = load_pose(inference)
         load_seconds = time.perf_counter() - started
-        LOGGER.info("Model initialization: %.2fs; benchmarking %d video(s)", load_seconds, len(videos))
+        LOGGER.log(PERF, "Model initialization: %.2fs; benchmarking %d video(s)", load_seconds, len(videos))
         failures = 0
         for video in videos:
             try:

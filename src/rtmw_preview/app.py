@@ -11,7 +11,7 @@ from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QImage, QPainter
 from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QMessageBox, QWidget
 
-from rtmw_preview.runtime import ROOT, configure_logging
+from rtmw_preview.runtime import PERF, ROOT, configure_logging
 
 LOGGER = logging.getLogger("preview")
 CAMERA_TIMEOUT = 5.0
@@ -80,7 +80,7 @@ class CameraWorker(QThread):
                 with self.lock:
                     self.latest = image, fps
                 if now - last_report >= 10:
-                    LOGGER.info("Camera + inference + rendering FPS: %.1f", fps)
+                    LOGGER.log(PERF, "Camera + inference + rendering FPS: %.1f", fps)
                     last_report = now
         except Exception as exc:
             LOGGER.exception("Preview stopped")
